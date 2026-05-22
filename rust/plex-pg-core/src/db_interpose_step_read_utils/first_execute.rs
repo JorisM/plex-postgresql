@@ -96,23 +96,61 @@ pub(super) fn first_execute_impl(
             }
         }
 
-        if use_streaming {
-            return streaming_fetch_result(
+        let result = if use_streaming {
+            streaming_fetch_result(
                 pg_stmt,
                 exec_conn_io,
                 exec_conn,
                 &mut stmt_guard,
                 &mut conn_guard,
                 pg_conn_error_out,
+            )
+        } else {
+            eager_fetch_result(
+                pg_stmt,
+                exec_conn_io,
+                exec_conn,
+                &mut stmt_guard,
+                &mut conn_guard,
+            )
+        };
+
+        if result == STEP_RESULT_DONE && crate::trace_env::flags().select_empty {
+            let tid = libc::pthread_self();
+            // Best-effort SQL excerpt — pg_sql is set at prepare time and only
+            // freed when the PgStmt itself is freed. The fetch_result helpers
+            // released the stmt_guard before returning, but the raw pointer
+            // remains valid for this synchronous read.
+            let sql_excerpt: String = {
+                let stmt = &*pg_stmt;
+                let raw_sql_ptr: *const c_char = if !stmt.pg_sql.is_null() {
+                    stmt.pg_sql
+                } else {
+                    stmt.sql
+                };
+                if raw_sql_ptr.is_null() {
+                    "<unknown>".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(raw_sql_ptr)
+                        .to_string_lossy()
+                        .chars()
+                        .take(160)
+                        .collect()
+                }
+            };
+            let raw_conn = if exec_conn.is_null() {
+                std::ptr::null_mut()
+            } else {
+                (*exec_conn).conn
+            };
+            crate::log_info_lazy!(
+                "[TRACE_SELECT_EMPTY] tid={:?} db={:p} sql='{}'",
+                tid,
+                raw_conn,
+                sql_excerpt
             );
         }
 
-        eager_fetch_result(
-            pg_stmt,
-            exec_conn_io,
-            exec_conn,
-            &mut stmt_guard,
-            &mut conn_guard,
-        )
+        result
     }
 }
