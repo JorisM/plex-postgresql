@@ -2,7 +2,7 @@
 # Dockerfile for plex-postgresql
 # Build with Alpine 3.15 which has musl 1.2.2 - same as Plex's bundled musl!
 
-FROM alpine:3.15 AS builder
+FROM docker.io/alpine:3.15 AS builder
 
 ARG PLEX_PG_SANITIZE
 ENV PLEX_PG_SANITIZE=${PLEX_PG_SANITIZE}
@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     sh scripts/docker-build-shim.sh
 
 # Runtime stage
-FROM linuxserver/plex:latest
+FROM docker.io/linuxserver/plex:latest
 
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging
