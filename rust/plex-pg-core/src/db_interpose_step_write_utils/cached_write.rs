@@ -230,6 +230,22 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 cc.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
             }
 
+            if status == PGRES_COMMAND_OK && crate::trace_env::flags().sql {
+                let tid = libc::pthread_self();
+                let rows_affected = crate::db_interpose_helpers::rust_pg_text_to_int(
+                    crate::libpq_helpers::rust_pq_cmd_tuples(res),
+                );
+                let sql_full = cstr_to_string_or(exec_sql, "(null)");
+                let sql_excerpt: String = sql_full.chars().take(160).collect();
+                crate::log_info_lazy!(
+                    "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid=<none> sql='{}'",
+                    tid,
+                    exec_conn,
+                    rows_affected,
+                    sql_excerpt
+                );
+            }
+
             if starts_with_icase_bytes(cstr_bytes(orig_sql), b"INSERT")
                 && status == PGRES_TUPLES_OK
                 && crate::libpq_helpers::rust_pq_ntuples(res) > 0
@@ -259,6 +275,22 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                         let ec = &mut *exec_conn;
                         ec.last_insert_rowid = rowid;
                         crate::pg_client::rust_set_global_last_insert_rowid(rowid);
+                        if crate::trace_env::flags().sql {
+                            let tid = libc::pthread_self();
+                            let rows_affected = crate::db_interpose_helpers::rust_pg_text_to_int(
+                                crate::libpq_helpers::rust_pq_cmd_tuples(res),
+                            );
+                            let sql_full = cstr_to_string_or(exec_sql, "(null)");
+                            let sql_excerpt: String = sql_full.chars().take(160).collect();
+                            crate::log_info_lazy!(
+                                "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid={} sql='{}'",
+                                tid,
+                                exec_conn,
+                                rows_affected,
+                                rowid,
+                                sql_excerpt
+                            );
+                        }
                     }
                     let meta_id = crate::pg_statement::rust_extract_metadata_id(orig_sql);
                     if meta_id > 0 {
