@@ -95,6 +95,7 @@ pub mod shim_alloc;
 mod sync_utils;
 #[cfg(test)]
 pub mod test_utils;
+pub(crate) mod trace_env;
 mod translation_validation;
 pub mod types;
 pub mod upsert;
