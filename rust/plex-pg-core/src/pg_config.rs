@@ -70,6 +70,16 @@ pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
         || lower.contains("sqlite_schema")
 }
 
+/// Returns true if the (lower-cased, ws-stripped) SQL begins with a
+/// transaction-control keyword that we treat as a no-op on PG.
+/// Used only by the TRACE_TXN logging hook — does NOT change skip behaviour.
+fn is_txn_control_lower(lower: &str) -> bool {
+    const TXN_PREFIXES: &[&str] = &[
+        "begin", "end", "commit", "rollback", "savepoint", "release ",
+    ];
+    TXN_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 /// Returns true if the SQL statement should be skipped (treated as a no-op).
 /// Step returns SQLITE_DONE without executing anything.
 /// NOTE: SQLite engine config (fts3_tokenizer, icu_load_collation, load_extension)
@@ -102,6 +112,15 @@ pub(crate) fn should_skip_sql_str(sql: &str) -> bool {
 
     for prefix in PREFIX_PATTERNS {
         if lower.starts_with(prefix) {
+            if crate::trace_env::flags().txn && is_txn_control_lower(&lower) {
+                let original = sql.trim();
+                let truncated: String = original.chars().take(160).collect();
+                crate::log_info_lazy!(
+                    "[TRACE_TXN] skip prefix='{}' sql='{}'",
+                    prefix,
+                    truncated
+                );
+            }
             return true;
         }
     }
@@ -969,5 +988,25 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("PLEX_PG_RETRY_DELAYS", v);
         }
+    }
+
+    #[test]
+    fn is_txn_control_lower_recognises_all_prefixes() {
+        assert!(super::is_txn_control_lower("begin"));
+        assert!(super::is_txn_control_lower("begin immediate"));
+        assert!(super::is_txn_control_lower("end"));
+        assert!(super::is_txn_control_lower("commit"));
+        assert!(super::is_txn_control_lower("commit transaction"));
+        assert!(super::is_txn_control_lower("rollback"));
+        assert!(super::is_txn_control_lower("savepoint sp1"));
+        assert!(super::is_txn_control_lower("release sp1"));
+    }
+
+    #[test]
+    fn is_txn_control_lower_rejects_non_txn() {
+        assert!(!super::is_txn_control_lower("select 1"));
+        assert!(!super::is_txn_control_lower("vacuum"));
+        assert!(!super::is_txn_control_lower("pragma journal_mode=wal"));
+        assert!(!super::is_txn_control_lower(""));
     }
 }
