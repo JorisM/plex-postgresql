@@ -131,6 +131,22 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             };
             ec.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
 
+            if status == PGRES_COMMAND_OK && crate::trace_env::flags().sql {
+                let tid = libc::pthread_self();
+                let rows_affected = crate::db_interpose_helpers::rust_pg_text_to_int(
+                    crate::libpq_helpers::rust_pq_cmd_tuples(res),
+                );
+                let sql_full = cstr_to_string_or(stmt.pg_sql, "(null)");
+                let sql_excerpt: String = sql_full.chars().take(160).collect();
+                crate::log_info_lazy!(
+                    "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid=<none> sql='{}' path=non-cached",
+                    tid,
+                    exec_conn,
+                    rows_affected,
+                    sql_excerpt
+                );
+            }
+
             if status == PGRES_TUPLES_OK && crate::libpq_helpers::rust_pq_ntuples(res) > 0 {
                 let mut id_buf = [0 as c_char; 64];
                 let mut id_str: *const c_char = std::ptr::null();
@@ -149,6 +165,22 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                     if rowid > 0 {
                         ec.last_insert_rowid = rowid;
                         crate::pg_client::rust_set_global_last_insert_rowid(rowid);
+                        if crate::trace_env::flags().sql {
+                            let tid = libc::pthread_self();
+                            let rows_affected = crate::db_interpose_helpers::rust_pg_text_to_int(
+                                crate::libpq_helpers::rust_pq_cmd_tuples(res),
+                            );
+                            let sql_full = cstr_to_string_or(stmt.pg_sql, "(null)");
+                            let sql_excerpt: String = sql_full.chars().take(160).collect();
+                            crate::log_info_lazy!(
+                                "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid={} sql='{}' path=non-cached",
+                                tid,
+                                exec_conn,
+                                rows_affected,
+                                rowid,
+                                sql_excerpt
+                            );
+                        }
                     }
 
                     if !stmt.pg_sql.is_null()
