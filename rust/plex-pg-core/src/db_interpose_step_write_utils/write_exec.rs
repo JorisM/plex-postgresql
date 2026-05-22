@@ -138,10 +138,11 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                 );
                 let sql_full = cstr_to_string_or(stmt.pg_sql, "(null)");
                 let sql_excerpt: String = sql_full.chars().take(160).collect();
+                let raw_conn = (*exec_conn).conn;
                 crate::log_info_lazy!(
                     "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid=<none> sql='{}' path=non-cached",
                     tid,
-                    exec_conn,
+                    raw_conn,
                     rows_affected,
                     sql_excerpt
                 );
@@ -172,10 +173,11 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                             );
                             let sql_full = cstr_to_string_or(stmt.pg_sql, "(null)");
                             let sql_excerpt: String = sql_full.chars().take(160).collect();
+                            let raw_conn = (*exec_conn).conn;
                             crate::log_info_lazy!(
                                 "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid={} sql='{}' path=non-cached",
                                 tid,
-                                exec_conn,
+                                raw_conn,
                                 rows_affected,
                                 rowid,
                                 sql_excerpt
