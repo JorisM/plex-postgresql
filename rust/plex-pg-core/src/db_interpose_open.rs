@@ -140,6 +140,20 @@ pub extern "C" fn rust_my_sqlite3_open(filename: *const c_char, pp_db: *mut *mut
 
     if !db.is_null() {
         track_db_handle_filename(db, filename);
+        if crate::trace_env::flags().open {
+            let path = unsafe {
+                if filename.is_null() {
+                    "<null>".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(filename).to_string_lossy().into_owned()
+                }
+            };
+            let tid = unsafe { libc::pthread_self() };
+            crate::log_info_lazy!(
+                "[TRACE_OPEN] tid={:?} db={:p} path='{}'",
+                tid, db, path
+            );
+        }
     }
 
     unsafe {
@@ -190,6 +204,20 @@ pub extern "C" fn rust_my_sqlite3_open_v2(
 
     if !db.is_null() {
         track_db_handle_filename(db, filename);
+        if crate::trace_env::flags().open {
+            let path = unsafe {
+                if filename.is_null() {
+                    "<null>".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(filename).to_string_lossy().into_owned()
+                }
+            };
+            let tid = unsafe { libc::pthread_self() };
+            crate::log_info_lazy!(
+                "[TRACE_OPEN] tid={:?} db={:p} path='{}'",
+                tid, db, path
+            );
+        }
     }
 
     unsafe {
