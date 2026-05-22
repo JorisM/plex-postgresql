@@ -243,6 +243,22 @@ pub(crate) fn exec_via_postgres(
                     };
                     pg.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
 
+                    if status == PGRES_COMMAND_OK && crate::trace_env::flags().sql {
+                        let tid = libc::pthread_self();
+                        let rows_affected = crate::db_interpose_helpers::rust_pg_text_to_int(
+                            crate::libpq_helpers::rust_pq_cmd_tuples(res),
+                        );
+                        let sql_full = cstr_to_string_or(exec_pg_sql, "(null)");
+                        let sql_excerpt: String = sql_full.chars().take(160).collect();
+                        crate::log_info_lazy!(
+                            "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid=<none> sql='{}' path=exec",
+                            tid,
+                            pg.conn,
+                            rows_affected,
+                            sql_excerpt
+                        );
+                    }
+
                     if starts_with_icase_bytes(sql_bytes, b"INSERT")
                         && status == PGRES_TUPLES_OK
                         && crate::libpq_helpers::rust_pq_ntuples(res) > 0
@@ -263,6 +279,23 @@ pub(crate) fn exec_via_postgres(
                             if let Some(rowid) = parse_positive_returning_rowid(id_str) {
                                 pg.last_insert_rowid = rowid;
                                 crate::pg_client::rust_set_global_last_insert_rowid(rowid);
+                                if crate::trace_env::flags().sql {
+                                    let tid = libc::pthread_self();
+                                    let rows_affected =
+                                        crate::db_interpose_helpers::rust_pg_text_to_int(
+                                            crate::libpq_helpers::rust_pq_cmd_tuples(res),
+                                        );
+                                    let sql_full = cstr_to_string_or(exec_pg_sql, "(null)");
+                                    let sql_excerpt: String = sql_full.chars().take(160).collect();
+                                    crate::log_info_lazy!(
+                                        "[TRACE_SQL] tid={:?} db={:p} rows_affected={} rowid={} sql='{}' path=exec",
+                                        tid,
+                                        pg.conn,
+                                        rows_affected,
+                                        rowid,
+                                        sql_excerpt
+                                    );
+                                }
                             }
                             if contains_bytes(sql_bytes, b"play_queue_generators") {
                                 log_info_lazy!(
