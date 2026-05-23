@@ -72,6 +72,20 @@ pub fn linux_handle_fork_child(_reason: &str) {
         fast_mark_fork_child_passthrough();
         crate::runtime_linux::disable_postfork_signal_overrides_fast();
         crate::pms_net_compat::disable_for_fork_child_fast();
-        let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+        // PR_SET_PDEATHSIG triggers on the CALLING THREAD's death, not the
+        // process's. When PMS forks helper services (Plex Tuner Service,
+        // Plex EAE Service) from a transient worker thread, that worker's
+        // subsequent exit signals SIGTERM to the freshly-exec'd helper
+        // before it can finish initialising — Tuner Service never writes
+        // its log file, PMS's Grabber polls forever, and PMS stays in
+        // Maintenance.
+        //
+        // Opt-in via PLEX_PG_FORK_CHILD_PDEATHSIG=1 if a future deployment
+        // needs the auto-reap behaviour. Default off restores Plex's own
+        // subreaper-based child management (which is already in place via
+        // the LSIO container's `subreaper` wrapper).
+        if crate::env_utils::env_truthy(b"PLEX_PG_FORK_CHILD_PDEATHSIG\0") {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+        }
     }
 }
