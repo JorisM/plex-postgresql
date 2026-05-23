@@ -51,6 +51,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # against). 1.43.2 surfaces incompatibilities (json_valid, boolean-int casts).
 FROM docker.io/linuxserver/plex:1.43.0
 
+# Build arg: control whether to wrap PMS with subreaper (defaults on).
+# Set --build-arg PLEX_PG_BUILD_USE_SUBREAPER=0 to skip the subreaper wrap
+# in svc-plex/run. Used to A/B test whether subreaper interferes with PMS's
+# internal helper-spawn logic (Plex Tuner Service, Plex EAE Service, IAPM
+# subsystem threads).
+ARG PLEX_PG_BUILD_USE_SUBREAPER=1
+
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -169,6 +176,11 @@ arch="$(uname -m)"\
 \nexport LD_LIBRARY_PATH="/usr/lib/plexmediaserver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\
 \nexport LD_PRELOAD="/usr/local/lib/plex-postgresql/db_interpose_pg.so"\
 ' /etc/s6-overlay/s6-rc.d/svc-plex/run && \
-    sed -i 's|"/usr/lib/plexmediaserver/Plex Media Server"|/usr/local/bin/subreaper "/usr/lib/plexmediaserver/Plex Media Server"|g' \
-        /etc/s6-overlay/s6-rc.d/svc-plex/run && \
+    if [ "${PLEX_PG_BUILD_USE_SUBREAPER:-1}" = "1" ]; then \
+        sed -i 's|"/usr/lib/plexmediaserver/Plex Media Server"|/usr/local/bin/subreaper "/usr/lib/plexmediaserver/Plex Media Server"|g' \
+            /etc/s6-overlay/s6-rc.d/svc-plex/run; \
+        echo "subreaper wrap ENABLED"; \
+    else \
+        echo "subreaper wrap DISABLED (PLEX_PG_BUILD_USE_SUBREAPER=0)"; \
+    fi && \
     cat /etc/s6-overlay/s6-rc.d/svc-plex/run
