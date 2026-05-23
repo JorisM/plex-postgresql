@@ -47,8 +47,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     rm -rf /usr/local/cargo/registry/src/index.crates.io-* && \
     sh scripts/docker-build-shim.sh
 
-# Runtime stage
-FROM docker.io/linuxserver/plex:latest
+# Runtime stage — pinned to 1.43.0 (the Plex version this shim is authored
+# against). 1.43.2 surfaces incompatibilities (json_valid, boolean-int casts).
+FROM docker.io/linuxserver/plex:1.43.0
 
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging

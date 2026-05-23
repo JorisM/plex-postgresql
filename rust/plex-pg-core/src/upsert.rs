@@ -210,7 +210,7 @@ fn make_do_update(
     conflict_target: Option<ConflictTarget>,
     exclude_cols: &[String],
 ) -> OnConflict {
-    let assignments: Vec<Assignment> = columns
+    let mut assignments: Vec<Assignment> = columns
         .iter()
         .filter(|col| {
             let col_lower = col.value.to_lowercase();
@@ -228,6 +228,26 @@ fn make_do_update(
             value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), col.clone()]),
         })
         .collect();
+
+    // When every column in the INSERT is either `id` or a conflict-target
+    // column (e.g. `schema_migrations(version)` with version as the unique
+    // key), the filter above yields an empty assignment list. Postgres
+    // rejects `DO UPDATE` without at least one assignment (`syntax error at
+    // or near "RETURNING"`). Fall back to a no-op assignment on the first
+    // conflict-target column so the statement is valid AND the trailing
+    // `RETURNING id` that cached_write appends still emits a row (needed by
+    // Bug #3's sqlite3_last_insert_rowid contract).
+    if assignments.is_empty() {
+        if let Some(first_excl) = exclude_cols.first() {
+            let col = Ident::new(first_excl.clone());
+            assignments.push(Assignment {
+                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                    col.clone(),
+                )])),
+                value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), col]),
+            });
+        }
+    }
 
     OnConflict {
         conflict_target,
