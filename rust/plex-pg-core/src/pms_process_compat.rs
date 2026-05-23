@@ -52,6 +52,19 @@ static mut ORIG_VFORK: Option<VForkFn> = None;
 
 static PROCESS_COMPAT_LOG_BUDGET: AtomicI32 = AtomicI32::new(0);
 static SUPPRESS_DAEMON: AtomicI32 = AtomicI32::new(0);
+// Master bypass: when set, every interposed process function (fork, vfork,
+// clone, daemon, prctl, pthread_setname_np, setsid, syscall) passes straight
+// through to the original libc implementation with no shim-side bookkeeping.
+// Used to A/B-test whether the process interpose layer is what blocks PMS
+// from spawning its helper services (Plex Tuner Service, Plex EAE Service)
+// and initialising its internal subsystems (IAPM, NetService, CPM thread
+// pools). Default off; opt-in via PLEX_PG_BYPASS_PROCESS_HOOKS=1.
+pub(crate) static BYPASS_PROCESS_HOOKS: AtomicI32 = AtomicI32::new(0);
+
+#[inline]
+pub(crate) fn bypass_process_hooks() -> bool {
+    BYPASS_PROCESS_HOOKS.load(Ordering::Relaxed) != 0
+}
 
 const DEFAULT_LOG_BUDGET: i32 = 24;
 const CLONE_WRAP_MASK: c_int = libc::CLONE_THREAD | libc::CLONE_VM | libc::CLONE_SIGHAND;
@@ -240,6 +253,19 @@ unsafe fn handle_syscall_child_fast_path(number: libc::c_long, a1: libc::c_long)
 }
 
 pub fn configure_from_env() {
+    let bypass = env_utils::env_truthy(b"PLEX_PG_BYPASS_PROCESS_HOOKS\0");
+    BYPASS_PROCESS_HOOKS.store(if bypass { 1 } else { 0 }, Ordering::Release);
+    if bypass {
+        unsafe {
+            let _ = libc::fprintf(
+                stderr_ptr(),
+                b"[SHIM_INIT] PMS process hooks BYPASSED via PLEX_PG_BYPASS_PROCESS_HOOKS (all fork/clone/vfork/daemon/exec/prctl/setname interposes pass through to libc)\n\0"
+                    .as_ptr() as *const c_char,
+            );
+            let _ = libc::fflush(stderr_ptr());
+        }
+    }
+
     let suppress = env_utils::env_truthy(b"PLEX_PG_SUPPRESS_DAEMON\0");
     SUPPRESS_DAEMON.store(if suppress { 1 } else { 0 }, Ordering::Release);
 
@@ -279,6 +305,10 @@ pub unsafe extern "C" fn daemon(nochdir: c_int, noclose: c_int) -> c_int {
         return -1;
     };
 
+    if bypass_process_hooks() {
+        return orig(nochdir, noclose);
+    }
+
     if daemon_suppressed() && likely_pms_primary_process() {
         if nochdir == 0 {
             let _ = libc::chdir(b"/\0".as_ptr() as *const c_char);
@@ -305,6 +335,10 @@ pub unsafe extern "C" fn fork() -> libc::pid_t {
         set_errno(libc::ENOSYS);
         return -1;
     };
+
+    if bypass_process_hooks() {
+        return orig();
+    }
 
     let rc = orig();
     if rc == 0 {
@@ -334,6 +368,10 @@ pub unsafe extern "C" fn clone(
         set_errno(libc::ENOSYS);
         return -1;
     };
+
+    if bypass_process_hooks() {
+        return orig(start_fn, stack, flags, arg, parent_tid, tls, child_tid);
+    }
 
     let aux = sanitize_clone_aux_args(flags, parent_tid, tls, child_tid);
     if !should_wrap_clone(flags) || start_fn.is_none() {
@@ -379,6 +417,10 @@ pub unsafe extern "C" fn vfork() -> libc::pid_t {
         return -1;
     };
 
+    if bypass_process_hooks() {
+        return orig();
+    }
+
     let rc = orig();
     if rc > 0 {
         maybe_log_event(b"vfork\0", i64::from(rc), 0);
@@ -403,6 +445,10 @@ pub unsafe extern "C" fn prctl(
         return -1;
     };
 
+    if bypass_process_hooks() {
+        return orig(option, arg2, arg3, arg4, arg5);
+    }
+
     let rc = orig(option, arg2, arg3, arg4, arg5);
     if rc == 0 && option == libc::PR_SET_NAME {
         maybe_log_event(b"prctl[set-name]\0", 0, 0);
@@ -417,6 +463,10 @@ pub unsafe extern "C" fn pthread_setname_np(thread: libc::pthread_t, name: *cons
     let Some(orig) = resolve_pthread_setname_np() else {
         return libc::ENOSYS;
     };
+
+    if bypass_process_hooks() {
+        return orig(thread, name);
+    }
 
     let rc = orig(thread, name);
     if rc == 0 && libc::pthread_equal(thread, libc::pthread_self()) != 0 {
@@ -433,6 +483,10 @@ pub unsafe extern "C" fn setsid() -> libc::pid_t {
         set_errno(libc::ENOSYS);
         return -1;
     };
+
+    if bypass_process_hooks() {
+        return orig();
+    }
 
     let rc = orig();
     let err = if rc < 0 { *libc::__errno_location() } else { 0 };
@@ -457,6 +511,10 @@ pub unsafe extern "C" fn syscall(
         set_errno(libc::ENOSYS);
         return -1;
     };
+
+    if bypass_process_hooks() {
+        return orig(number, a1, a2, a3, a4, a5, a6);
+    }
 
     let rc = orig(number, a1, a2, a3, a4, a5, a6);
     if rc == 0 {
