@@ -107,14 +107,26 @@ fn rewrite_data_type(dt: DataType) -> DataType {
         // BLOB → BYTEA
         DataType::Blob(_) => DataType::Bytea,
 
-        // datetime (natively parsed as Datetime) → TIMESTAMP
-        DataType::Datetime(_) => DataType::Timestamp(None, TimezoneInfo::None),
+        // datetime → BIGINT (epoch seconds)
+        //
+        // SQLite has dynamic typing — `datetime` is a type-affinity HINT, not
+        // a real type. Plex stores datetime columns as integer Unix epochs in
+        // the SQLite library DB (e.g. `updated_at = 1696118400`). The existing
+        // plex_schema.sql dump (used by the pre-populated PG path) declares
+        // these columns as BIGINT. The forward-migration path must agree:
+        // mapping `datetime` to TIMESTAMP creates a type split between the
+        // pre-existing tables (BIGINT) and any tables PMS DROPs + CREATEs
+        // during a forward migration (which would otherwise become TIMESTAMP),
+        // and the date-literal rewriter (which emits
+        // `EXTRACT(EPOCH FROM '…'::timestamp)::bigint`) only works against
+        // BIGINT columns.
+        DataType::Datetime(_) => DataType::BigInt(None),
 
         // Custom types: datetime (fallback), INTEGER(8), dt_integer
         DataType::Custom(ref name, ref params) => {
             let name_str = name.to_string().to_lowercase();
             match name_str.as_str() {
-                "datetime" => DataType::Timestamp(None, TimezoneInfo::None),
+                "datetime" => DataType::BigInt(None),
                 "integer" | "dt_integer" => {
                     // If parameterized with 8, treat as BIGINT
                     if params.contains(&"8".to_string()) {
@@ -149,10 +161,11 @@ mod tests {
     }
 
     #[test]
-    fn subset_core__type_datetime_to_timestamp() {
+    fn subset_core__type_datetime_to_bigint() {
         let r = translate("CREATE TABLE t (created_at datetime)").unwrap();
-        assert!(r.sql.to_uppercase().contains("TIMESTAMP"));
+        assert!(r.sql.to_uppercase().contains("BIGINT"));
         assert!(!r.sql.to_lowercase().contains("datetime"));
+        assert!(!r.sql.to_uppercase().contains("TIMESTAMP"));
     }
 
     #[test]
