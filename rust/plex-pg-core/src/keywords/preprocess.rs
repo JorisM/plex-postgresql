@@ -1434,11 +1434,24 @@ fn rewrite_create_table_single_quoted_identifiers(sql: &str) -> String {
         let lower = t.to_ascii_lowercase();
         if lower.starts_with("create table") {
             out.push(rewrite_single_create_table_quoted_idents(t));
-        } else if lower.starts_with("drop table") || lower.starts_with("alter table") {
-            // DROP TABLE [IF EXISTS] '<name>' and ALTER TABLE '<name>' ...
-            // contain only identifiers + keywords (no DEFAULT clauses or
-            // string-literal-bearing expressions), so all single-quoted
-            // simple identifiers can be safely converted to double-quoted.
+        } else if lower.starts_with("drop table") {
+            // DROP TABLE [IF EXISTS] '<name>' — convert single-quoted
+            // identifiers AND ensure CASCADE is present. SQLite drops
+            // tables with dangling FK references silently; PG refuses
+            // without CASCADE when other objects depend on the table.
+            // Plex migrations rely on the SQLite behaviour, so emit
+            // CASCADE unconditionally unless one is already specified.
+            let q = rewrite_identifier_quotes_in_segment(t);
+            let q_lower = q.to_ascii_lowercase();
+            if q_lower.contains(" cascade") || q_lower.contains(" restrict") {
+                out.push(q);
+            } else {
+                out.push(format!("{} CASCADE", q.trim_end_matches(';')));
+            }
+        } else if lower.starts_with("alter table") {
+            // ALTER TABLE '<name>' ... contains only identifiers +
+            // keywords, no string-literal-bearing expressions. Safe to
+            // convert all single-quoted simple identifiers to double-quoted.
             out.push(rewrite_identifier_quotes_in_segment(t));
         } else {
             out.push(t.to_string());
