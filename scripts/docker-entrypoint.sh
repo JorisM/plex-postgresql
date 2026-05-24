@@ -89,47 +89,52 @@ init_schema() {
     local schema="${PLEX_PG_SCHEMA:-plex}"
     local schema_file="/usr/local/lib/plex-postgresql/plex_schema.sql"
     local compat_file="/usr/local/lib/plex-postgresql/pg_compat_functions.sql"
+    local types_file="/usr/local/lib/plex-postgresql/sqlite_column_types.sql"
 
     psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" 2>/dev/null || true
+    psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
 
-    local table_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
-
-    if [ "$table_count" -gt "0" ] 2>/dev/null; then
-        echo "PostgreSQL schema '$schema' ready with $table_count tables"
-        # Load sqlite_column_types metadata if table doesn't exist yet
-        local types_file="/usr/local/lib/plex-postgresql/sqlite_column_types.sql"
-        if [ -f "$types_file" ]; then
-            local types_exists=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'sqlite_column_types';" 2>/dev/null | tr -d ' ')
-            if [ "$types_exists" = "0" ] 2>/dev/null; then
-                echo "Loading sqlite_column_types metadata..."
-                psql -f "$types_file" 2>/dev/null || true
-            fi
-        fi
+    # PLEX_PG_SKIP_APP_SCHEMA=1: do NOT load the pre-populated plex_schema.sql.
+    # In that mode the shim is expected to let PMS run the full forward
+    # migration chain through it, against an empty schema, so the
+    # DatabaseFixups / ChildProcessMonitor / agent plug-in spawning side
+    # effects of PMS's startup state machine actually fire.
+    # sqlite_column_types + pg_compat_functions are shim infrastructure and
+    # are always loaded regardless of this flag.
+    if is_truthy "${PLEX_PG_SKIP_APP_SCHEMA:-}"; then
+        echo "PLEX_PG_SKIP_APP_SCHEMA=1 — skipping plex_schema.sql load; PMS will run migrations through shim"
     else
-        echo "PostgreSQL schema '$schema' is empty, loading schema..."
-        if [ -f "$schema_file" ]; then
-            echo "Loading schema from $schema_file..."
-            psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
-            if psql -f "$schema_file" 2>&1; then
-                local new_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
-                echo "Schema loaded successfully! $new_count tables created."
-
-                # NOTE: schema_migrations rows from the dump are kept intact.
-                # The shim intercepts INSERT INTO schema_migrations and adds
-                # ON CONFLICT DO NOTHING, so duplicate versions are silently ignored.
-                # This prevents Plex from re-running all 446 migrations from scratch,
-                # which causes DDL/schema divergence issues with the SQLite shadow DB.
-                local migration_count=$(psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ')
-                echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
-            else
-                echo "WARNING: Schema load had errors, continuing anyway..."
-            fi
+        local table_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
+        if [ "$table_count" -gt "0" ] 2>/dev/null; then
+            echo "PostgreSQL schema '$schema' ready with $table_count tables"
         else
-            echo "WARNING: Schema file $schema_file not found!"
+            echo "PostgreSQL schema '$schema' is empty, loading schema..."
+            if [ -f "$schema_file" ]; then
+                echo "Loading schema from $schema_file..."
+                if psql -f "$schema_file" 2>&1; then
+                    local new_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
+                    echo "Schema loaded successfully! $new_count tables created."
+
+                    # NOTE: schema_migrations rows from the dump are kept intact.
+                    # The shim intercepts INSERT INTO schema_migrations and adds
+                    # ON CONFLICT DO NOTHING, so duplicate versions are silently ignored.
+                    # This prevents Plex from re-running all 446 migrations from scratch,
+                    # which causes DDL/schema divergence issues with the SQLite shadow DB.
+                    local migration_count=$(psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ')
+                    echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
+                else
+                    echo "WARNING: Schema load had errors, continuing anyway..."
+                fi
+            else
+                echo "WARNING: Schema file $schema_file not found!"
+            fi
         fi
-        # Load sqlite_column_types metadata after fresh schema load
-        local types_file="/usr/local/lib/plex-postgresql/sqlite_column_types.sql"
-        if [ -f "$types_file" ]; then
+    fi
+
+    # Shim infrastructure — always loaded (idempotent if rows present).
+    if [ -f "$types_file" ]; then
+        local types_exists=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'sqlite_column_types';" 2>/dev/null | tr -d ' ')
+        if [ "$types_exists" = "0" ] 2>/dev/null; then
             echo "Loading sqlite_column_types metadata..."
             psql -f "$types_file" 2>/dev/null || true
         fi
@@ -468,16 +473,28 @@ if [ -n "$PLEX_PG_HOST" ]; then
     wait_for_postgres
     init_schema
 
-    # Run migration if source SQLite DB exists (mounted via -v)
-    if [[ -f "$MIGRATE_LIB" ]] && [[ -f "$SQLITE_DB" ]]; then
+    # Run migration if source SQLite DB exists (mounted via -v).
+    # PLEX_PG_SKIP_APP_SCHEMA=1 also disables this — there's nothing to copy
+    # when we want PMS to bootstrap its schema from scratch.
+    if [[ -f "$MIGRATE_LIB" ]] && [[ -f "$SQLITE_DB" ]] && ! is_truthy "${PLEX_PG_SKIP_APP_SCHEMA:-}"; then
         echo "Checking for data migration..."
         check_and_migrate || true
+    elif is_truthy "${PLEX_PG_SKIP_APP_SCHEMA:-}"; then
+        echo "PLEX_PG_SKIP_APP_SCHEMA=1 — skipping check_and_migrate"
     fi
 
     ensure_plex_temp_dir
     init_plex_directories
     maybe_clear_flags_dat_on_uuid_error
-    init_sqlite_schema
+    # init_sqlite_schema pre-populates the shadow SQLite library.db with the
+    # shim's expected schema. When PLEX_PG_SKIP_APP_SCHEMA=1 we want PMS to
+    # install its own library.db template and run its forward migrations, so
+    # skip the pre-population to avoid schema conflicts.
+    if is_truthy "${PLEX_PG_SKIP_APP_SCHEMA:-}"; then
+        echo "PLEX_PG_SKIP_APP_SCHEMA=1 — skipping init_sqlite_schema (PMS will install template)"
+    else
+        init_sqlite_schema
+    fi
     verify_plex_shim
     verify_media_mount
     
