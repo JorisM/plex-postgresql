@@ -16,6 +16,7 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     let sql = rewrite_glob(&sql);
     let sql = rewrite_indexed_by(&sql);
     let sql = rewrite_index_ddl_identifier_quotes(&sql);
+    let sql = rewrite_date_literal_comparisons(&sql);
     let sql = rewrite_sqlite_collations(&sql);
     let sql = rewrite_distinct_orderby_projection(&sql);
     rewrite_metadata_items_self_join(&sql)
@@ -1641,6 +1642,260 @@ fn next_significant_is_ident_terminator(stmt: &str, from: usize) -> bool {
     // Likely a SQL type keyword (INTEGER, TEXT, BLOB, REAL, NUMERIC, DATETIME,
     // VARCHAR, ...) — accept any ASCII letter starting position.
     nxt.is_ascii_alphabetic()
+}
+
+/// Plex stores datetime columns (`updated_at`, `created_at`, `added_at`,
+/// `last_viewed_at`, `originally_available_at`, `scanned_at`, `accessed_at`,
+/// `installed_at`, `modified_at`, `changed_at`, `content_changed_at`,
+/// `started_at`, `finished_at`, `applied_at`, `at`, …) as INTEGER /
+/// BIGINT epoch seconds in PG.
+///
+/// SQLite's type affinity coerces text date literals to comparable values
+/// when one side of a comparison is an INTEGER column. PG's strict typing
+/// refuses to compare a BIGINT column to a text literal `'2013-09-01'`:
+///
+///     ERROR: invalid input syntax for type bigint: "2013-09-01"
+///
+/// This pass detects `<ident> OP '<date-or-datetime>'` comparisons in SQL
+/// (with `OP` in `> < >= <= = != <>`) and rewrites the RHS literal to
+/// `EXTRACT(EPOCH FROM '<literal>'::timestamp)::bigint`. PG can evaluate
+/// the cast at runtime and the result is always a bigint, which compares
+/// cleanly with bigint columns.
+///
+/// The rewrite is content-agnostic: it does not consult column metadata
+/// and so will also convert literals compared against TEXT columns that
+/// happen to store dates. In Plex's schema, no such column exists in
+/// migration SQL — Plex stores dates as integer epochs everywhere they
+/// participate in comparison clauses. If a false positive turns up in
+/// a future migration, the pass can be tightened by consulting
+/// `sqlite_column_types` at runtime; for now the heuristic is sufficient.
+///
+/// The pass is applied uniformly across the whole statement string. It is
+/// safe for DDL (no date literals appear in CREATE TABLE column lists
+/// since DEFAULT clauses for epoch columns use integer literals, not text
+/// date literals) and for SELECT/INSERT/UPDATE/DELETE.
+fn rewrite_date_literal_comparisons(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Pass through line comments, block comments, and quoted strings
+        // verbatim so the rewriter does not touch identifiers or string
+        // values that contain look-alike date substrings.
+        if i + 1 < bytes.len() && b == b'-' && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && b == b'/' && bytes[i + 1] == b'*' {
+            out.push(bytes[i] as char);
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                out.push(bytes[i] as char);
+                out.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'`' {
+            let quote = b;
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i] as char);
+                if bytes[i] == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        out.push(quote as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Try to detect a comparison operator. Track the byte before the
+        // operator: it must be either whitespace following a bare identifier
+        // (rough heuristic for "RHS comes after an identifier comparison")
+        // or a closing paren / right-bracket etc.; the rewriter only fires
+        // when the comparison RHS starts with a single-quoted date literal.
+        if matches!(b, b'<' | b'>' | b'=' | b'!') {
+            // Read the operator token.
+            let op_start = i;
+            let mut op_end = i + 1;
+            if op_end < bytes.len() {
+                let next = bytes[op_end];
+                // Two-char operators: <=, >=, <>, !=
+                if (b == b'<' && (next == b'=' || next == b'>'))
+                    || (b == b'>' && next == b'=')
+                    || (b == b'!' && next == b'=')
+                {
+                    op_end += 1;
+                }
+            }
+            // For '=', '!=', '<>', '<', '>', '<=', '>=' followed by date literal,
+            // rewrite. For '!' alone (without '='), pass through.
+            let op = &sql[op_start..op_end];
+            let is_comparison = matches!(op, "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=");
+
+            // Emit the operator.
+            for &c in &bytes[op_start..op_end] {
+                out.push(c as char);
+            }
+            i = op_end;
+
+            if !is_comparison {
+                continue;
+            }
+
+            // Skip whitespace.
+            let mut k = i;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+
+            // Emit the whitespace.
+            while i < k {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+
+            if k >= bytes.len() || bytes[k] != b'\'' {
+                continue;
+            }
+
+            // Tentatively read the single-quoted literal.
+            let mut j = k + 1;
+            let mut content = String::new();
+            let mut closed = false;
+            while j < bytes.len() {
+                if bytes[j] == b'\'' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                        content.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    closed = true;
+                    j += 1;
+                    break;
+                }
+                content.push(bytes[j] as char);
+                j += 1;
+            }
+
+            if closed && is_date_or_datetime_literal(&content) {
+                out.push_str(&format!(
+                    "EXTRACT(EPOCH FROM '{}'::timestamp)::bigint",
+                    content
+                ));
+                i = j;
+                continue;
+            }
+
+            // Not a date literal — emit verbatim.
+            while i < j {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+
+        if b == b'\'' {
+            // Standalone single-quoted string (not preceded by a comparison
+            // operator handled above). Pass through verbatim.
+            out.push('\'');
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i] as char);
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        out.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(b as char);
+        i += 1;
+    }
+
+    out
+}
+
+fn is_date_or_datetime_literal(s: &str) -> bool {
+    // YYYY-MM-DD or YYYY-MM-DD HH:MM:SS (with optional fractional seconds).
+    let bytes = s.as_bytes();
+    if bytes.len() < 10 {
+        return false;
+    }
+    let date_part_ok = bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[7] == b'-'
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit();
+    if !date_part_ok {
+        return false;
+    }
+    if bytes.len() == 10 {
+        return true;
+    }
+    // Optional " HH:MM:SS[.fff]" or "THH:MM:SS[.fff]"
+    let sep = bytes[10];
+    if sep != b' ' && sep != b'T' {
+        return false;
+    }
+    let rest = &s[11..];
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes.len() < 8 {
+        return false;
+    }
+    let time_part_ok = rest_bytes[0].is_ascii_digit()
+        && rest_bytes[1].is_ascii_digit()
+        && rest_bytes[2] == b':'
+        && rest_bytes[3].is_ascii_digit()
+        && rest_bytes[4].is_ascii_digit()
+        && rest_bytes[5] == b':'
+        && rest_bytes[6].is_ascii_digit()
+        && rest_bytes[7].is_ascii_digit();
+    if !time_part_ok {
+        return false;
+    }
+    if rest_bytes.len() == 8 {
+        return true;
+    }
+    // Allow trailing ".fff" or "Z" or " UTC"; if anything else, reject so we
+    // don't false-positive arbitrary strings that just happen to start with
+    // a date prefix.
+    let tail = &rest[8..];
+    tail.starts_with('.')
+        || tail == "Z"
+        || tail.starts_with(' ')
+        || tail.starts_with('+')
+        || tail.starts_with('-')
 }
 
 fn rewrite_index_ddl_identifier_quotes(sql: &str) -> String {
