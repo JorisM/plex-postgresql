@@ -1407,8 +1407,15 @@ fn rewrite_create_table_single_quoted_identifiers(sql: &str) -> String {
         if t.is_empty() {
             continue;
         }
-        if t.to_ascii_lowercase().starts_with("create table") {
+        let lower = t.to_ascii_lowercase();
+        if lower.starts_with("create table") {
             out.push(rewrite_single_create_table_quoted_idents(t));
+        } else if lower.starts_with("drop table") || lower.starts_with("alter table") {
+            // DROP TABLE [IF EXISTS] '<name>' and ALTER TABLE '<name>' ...
+            // contain only identifiers + keywords (no DEFAULT clauses or
+            // string-literal-bearing expressions), so all single-quoted
+            // simple identifiers can be safely converted to double-quoted.
+            out.push(rewrite_identifier_quotes_in_segment(t));
         } else {
             out.push(t.to_string());
         }
