@@ -10,6 +10,7 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     let sql = rewrite_update_delete_limit_statements(&sql);
     let sql = rewrite_transaction_control_statements(&sql);
     let sql = rewrite_pragma_statements(&sql);
+    let sql = rewrite_create_table_single_quoted_identifiers(&sql);
     let sql = rewrite_sqlite_create_table_options(&sql);
     let sql = rewrite_virtual_tables(&sql);
     let sql = rewrite_glob(&sql);
@@ -1369,6 +1370,277 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
     out
+}
+
+/// SQLite tolerates single-quoted identifiers in DDL contexts (CREATE TABLE
+/// column lists, table names, FOREIGN KEY/PRIMARY KEY/UNIQUE column refs).
+/// PostgreSQL — and `sqlparser-rs` — only accept double-quoted identifiers
+/// in those positions; single quotes are strictly string literals.
+///
+/// Plex's older forward migrations (notably `20101001034731` and several
+/// migrations from 2010-2014) emit DDL like:
+///
+///     CREATE TABLE 'library_timeline_entries' (
+///         'id' INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+///         'library_section_id' integer,
+///         ...
+///     )
+///
+/// This rewrite locates single-quoted tokens in identifier-only positions
+/// inside CREATE TABLE statements and converts them to double-quoted.
+///
+/// "Identifier-only position" is conservatively detected by checking the
+/// next non-whitespace character after the quoted token:
+///   `,`  `)` `(`  — column lists, end of list, start of nested list
+///   ASCII alphabetic — likely the start of a type keyword (INTEGER, TEXT, …)
+///
+/// String literals like `DEFAULT 'pending'` are NOT touched because:
+///   - DEFAULT clauses come after a type keyword (the heuristic above only
+///     fires immediately after `(` or `,`, never after a type)
+///   - String values often contain whitespace or special characters that
+///     don't match the bare-identifier regex
+fn rewrite_create_table_single_quoted_identifiers(sql: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for stmt in split_sql_statements(sql) {
+        let t = stmt.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.to_ascii_lowercase().starts_with("create table") {
+            out.push(rewrite_single_create_table_quoted_idents(t));
+        } else {
+            out.push(t.to_string());
+        }
+    }
+    out.join("; ")
+}
+
+fn rewrite_single_create_table_quoted_idents(stmt: &str) -> String {
+    let bytes = stmt.as_bytes();
+    let mut result = String::with_capacity(stmt.len());
+    let mut i = 0usize;
+
+    // Convert single-quoted table name after CREATE TABLE [IF NOT EXISTS]
+    let header_end = consume_create_table_header_into(stmt, &mut result, &mut i);
+    if !header_end {
+        // No recognised CREATE TABLE header; bail out unchanged.
+        return stmt.to_string();
+    }
+
+    // Walk the rest of the statement. In identifier position (start of
+    // statement, just after '(' or ','), convert single-quoted simple
+    // identifiers to double-quoted. Outside those positions, copy bytes
+    // verbatim — string literals are preserved.
+    let mut last_significant: u8 = b'(';
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b.is_ascii_whitespace() {
+            result.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        // Inline comments and block comments — copy verbatim.
+        if i + 1 < bytes.len() && b == b'-' && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && b == b'/' && bytes[i + 1] == b'*' {
+            result.push(bytes[i] as char);
+            result.push(bytes[i + 1] as char);
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                result.push(bytes[i] as char);
+                result.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            continue;
+        }
+
+        if b == b'\'' {
+            // Tentatively read the single-quoted token.
+            let mut j = i + 1;
+            let mut content = String::new();
+            let mut closed = false;
+            while j < bytes.len() {
+                if bytes[j] == b'\'' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                        // Escaped quote inside the literal — not an identifier.
+                        content.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    closed = true;
+                    j += 1;
+                    break;
+                }
+                content.push(bytes[j] as char);
+                j += 1;
+            }
+
+            if closed
+                && is_simple_identifier(&content)
+                && in_identifier_position(last_significant)
+                && next_significant_is_ident_terminator(stmt, j)
+            {
+                result.push('"');
+                result.push_str(&content);
+                result.push('"');
+                i = j;
+                last_significant = b'"';
+                continue;
+            }
+
+            // Not an identifier — emit the original literal verbatim.
+            while i < j {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            last_significant = b'\'';
+            continue;
+        }
+
+        if b == b'"' || b == b'`' {
+            // Already-quoted identifier — pass through.
+            let quote = b;
+            result.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                result.push(bytes[i] as char);
+                if bytes[i] == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        result.push(quote as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            last_significant = quote;
+            continue;
+        }
+
+        result.push(b as char);
+        if !b.is_ascii_whitespace() {
+            last_significant = b;
+        }
+        i += 1;
+    }
+
+    result
+}
+
+fn consume_create_table_header_into(stmt: &str, result: &mut String, i: &mut usize) -> bool {
+    let bytes = stmt.as_bytes();
+    let lower = stmt.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+
+    // "create table"
+    if !lower.starts_with("create table") {
+        return false;
+    }
+    let mut j = "create table".len();
+
+    // Optional " temp"/" temporary"
+    let after = skip_ascii_ws(lower_bytes, j);
+    if lower_bytes.get(after..after + 9) == Some(b"temporary") {
+        j = after + 9;
+    } else if lower_bytes.get(after..after + 4) == Some(b"temp") {
+        j = after + 4;
+    }
+
+    // Optional " if not exists"
+    let after = skip_ascii_ws(lower_bytes, j);
+    if lower_bytes.get(after..after + 13) == Some(b"if not exists") {
+        j = after + 13;
+    }
+
+    // Copy "CREATE TABLE [TEMP] [IF NOT EXISTS]" preamble verbatim.
+    while *i < j {
+        result.push(bytes[*i] as char);
+        *i += 1;
+    }
+    // Copy whitespace separating preamble from table name.
+    while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+        result.push(bytes[*i] as char);
+        *i += 1;
+    }
+
+    // Table name: may be `name`, `"name"`, or `'name'` (the case we fix).
+    // It may also be schema-qualified (`schema.name`).
+    if *i >= bytes.len() {
+        return false;
+    }
+    if bytes[*i] == b'\'' {
+        // Read until closing single quote.
+        let mut k = *i + 1;
+        let mut content = String::new();
+        let mut closed = false;
+        while k < bytes.len() {
+            if bytes[k] == b'\'' {
+                if k + 1 < bytes.len() && bytes[k + 1] == b'\'' {
+                    content.push('\'');
+                    k += 2;
+                    continue;
+                }
+                closed = true;
+                k += 1;
+                break;
+            }
+            content.push(bytes[k] as char);
+            k += 1;
+        }
+        if closed && is_simple_identifier(&content) {
+            result.push('"');
+            result.push_str(&content);
+            result.push('"');
+            *i = k;
+            return true;
+        }
+        // Not a simple identifier — leave alone.
+        while *i < k {
+            result.push(bytes[*i] as char);
+            *i += 1;
+        }
+        return true;
+    }
+
+    // Other table-name forms (bare, double-quoted, backtick-quoted) — no
+    // transformation needed; just hand back to the main loop which copies
+    // through the rest of the statement.
+    true
+}
+
+fn in_identifier_position(last_significant: u8) -> bool {
+    matches!(last_significant, b'(' | b',')
+}
+
+fn next_significant_is_ident_terminator(stmt: &str, from: usize) -> bool {
+    let bytes = stmt.as_bytes();
+    let mut k = from;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k >= bytes.len() {
+        return false;
+    }
+    let nxt = bytes[k];
+    if matches!(nxt, b',' | b')' | b'(') {
+        return true;
+    }
+    // Likely a SQL type keyword (INTEGER, TEXT, BLOB, REAL, NUMERIC, DATETIME,
+    // VARCHAR, ...) — accept any ASCII letter starting position.
+    nxt.is_ascii_alphabetic()
 }
 
 fn rewrite_index_ddl_identifier_quotes(sql: &str) -> String {
