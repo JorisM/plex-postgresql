@@ -97,14 +97,11 @@ pub fn scrub_current_process_preload() {
     if !is_enabled() {
         return;
     }
-    if crate::pms_process_compat::bypass_process_hooks() {
-        // Master bypass active: leave PMS's LD_PRELOAD entry intact so future
-        // helper-spawn execve calls (which we also no-op below) inherit the
-        // shim. Without this guard, even though execve passes through, PMS
-        // proper has its LD_PRELOAD wiped — irrelevant when we also pass
-        // execve through, but inconsistent state otherwise.
-        return;
-    }
+    // NOTE: bypass_process_hooks() intentionally does NOT short-circuit here.
+    // Bypass applies to process-control interposes (fork/daemon/prctl/...) in
+    // pms_process_compat.rs, but child env scrubbing is independent: helper
+    // children (Python plug-ins, scanner, transcoders) must NOT inherit the
+    // shim via LD_PRELOAD or they wedge on first sqlite3_open.
 
     let had_preload = capture_self_ld_preload().is_some();
     unsafe {
@@ -506,9 +503,8 @@ pub unsafe extern "C" fn execve(
         return -1;
     };
 
-    if crate::pms_process_compat::bypass_process_hooks() {
-        return orig(path, argv, envp);
-    }
+    // bypass_process_hooks() intentionally does NOT short-circuit env scrub.
+    // Helper children (Python plug-ins, scanner) must not inherit LD_PRELOAD.
 
     if let Some((label, filtered)) = adjusted_env_for_process(path, argv, envp) {
         maybe_log_adjustment(
@@ -534,9 +530,7 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char)
         return -1;
     };
 
-    if crate::pms_process_compat::bypass_process_hooks() {
-        return orig_execvp(file, argv);
-    }
+    // bypass_process_hooks() intentionally does NOT short-circuit env scrub.
 
     let Some((label, filtered)) = adjusted_env_for_process(file, argv, ptr::null()) else {
         return orig_execvp(file, argv);
@@ -570,9 +564,7 @@ pub unsafe extern "C" fn execvpe(
         return -1;
     };
 
-    if crate::pms_process_compat::bypass_process_hooks() {
-        return orig(file, argv, envp);
-    }
+    // bypass_process_hooks() intentionally does NOT short-circuit env scrub.
 
     if let Some((label, filtered)) = adjusted_env_for_process(file, argv, envp) {
         maybe_log_adjustment(
@@ -604,9 +596,7 @@ pub unsafe extern "C" fn posix_spawn(
         return libc::ENOSYS;
     };
 
-    if crate::pms_process_compat::bypass_process_hooks() {
-        return orig(pid, path, file_actions, attrp, argv, envp);
-    }
+    // bypass_process_hooks() intentionally does NOT short-circuit env scrub.
 
     if let Some((label, filtered)) = adjusted_env_for_process(path, argv, envp) {
         maybe_log_adjustment(
@@ -638,9 +628,7 @@ pub unsafe extern "C" fn posix_spawnp(
         return libc::ENOSYS;
     };
 
-    if crate::pms_process_compat::bypass_process_hooks() {
-        return orig(pid, file, file_actions, attrp, argv, envp);
-    }
+    // bypass_process_hooks() intentionally does NOT short-circuit env scrub.
 
     if let Some((label, filtered)) = adjusted_env_for_process(file, argv, envp) {
         maybe_log_adjustment(
