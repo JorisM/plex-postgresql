@@ -27,10 +27,26 @@ check_and_migrate() {
         return 0
     fi
 
-    local sqlite_count=$(sqlite3 "$SQLITE_DB" "SELECT COUNT(*) FROM metadata_items;" 2>/dev/null || echo "0")
+    # Count rows across the seed tables PMS populates during first-run setup.
+    # Treating an empty metadata_items as "empty database" misses fresh-install
+    # SQLite snapshots whose accounts / plugins / preferences / tags tables ARE
+    # populated — without those seed rows PMS sees an "existing install" state
+    # in PG (schema present, no seed) and wedges in Maintenance forever
+    # because MediaProviderManager can't resolve provider stubs.
+    local sqlite_count=$(sqlite3 "$SQLITE_DB" "
+        SELECT
+            (SELECT COUNT(*) FROM metadata_items)
+          + (SELECT COUNT(*) FROM accounts)
+          + (SELECT COUNT(*) FROM plugins)
+          + (SELECT COUNT(*) FROM preferences)
+          + (SELECT COUNT(*) FROM tags)
+          + (SELECT COUNT(*) FROM activities)
+          + (SELECT COUNT(*) FROM metadata_agent_providers)
+          + (SELECT COUNT(*) FROM schema_migrations);
+    " 2>/dev/null || echo "0")
 
     if [[ "$sqlite_count" -eq 0 ]]; then
-        echo -e "${BLUE}Existing Plex database is empty. No migration needed.${NC}"
+        echo -e "${BLUE}Existing Plex database is empty (no metadata + no seed rows). No migration needed.${NC}"
         return 0
     fi
 
