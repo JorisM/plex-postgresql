@@ -1270,10 +1270,16 @@ fn rewrite_single_virtual_table_stmt(stmt: &str) -> Option<String> {
         return None;
     }
 
-    let using_fts = " using fts5(";
+    let using_fts5 = " using fts5(";
+    let using_fts4 = " using fts4(";
+    let using_fts3 = " using fts3(";
     let using_rtree = " using rtree(";
-    let (using_idx, mode, using_len) = if let Some(idx) = lower.find(using_fts) {
-        (idx, "fts5", using_fts.len())
+    let (using_idx, mode, using_len) = if let Some(idx) = lower.find(using_fts5) {
+        (idx, "fts", using_fts5.len())
+    } else if let Some(idx) = lower.find(using_fts4) {
+        (idx, "fts", using_fts4.len())
+    } else if let Some(idx) = lower.find(using_fts3) {
+        (idx, "fts", using_fts3.len())
     } else if let Some(idx) = lower.find(using_rtree) {
         (idx, "rtree", using_rtree.len())
     } else {
@@ -1294,11 +1300,29 @@ fn rewrite_single_virtual_table_stmt(stmt: &str) -> Option<String> {
     let cols = split_csv_top_level(cols_raw);
 
     let mut defs: Vec<String> = Vec::new();
-    if mode == "fts5" {
+    if mode == "fts" {
         defs.push("id BIGSERIAL PRIMARY KEY".to_string());
         for c in cols {
-            let col = extract_ident_token(&c);
-            if col.is_empty() || col.to_ascii_lowercase().starts_with("tokenize") {
+            let trimmed = c.trim();
+            let lower_c = trimmed.to_ascii_lowercase();
+            // Skip FTS4/5 module options: tokenize=..., content=...,
+            // content_rowid=..., prefix=..., languageid=..., notindexed=...,
+            // matchinfo=..., compress=..., uncompress=..., order=...
+            if lower_c.starts_with("tokenize")
+                || lower_c.starts_with("content=")
+                || lower_c.starts_with("content_rowid")
+                || lower_c.starts_with("prefix=")
+                || lower_c.starts_with("languageid")
+                || lower_c.starts_with("notindexed")
+                || lower_c.starts_with("matchinfo")
+                || lower_c.starts_with("compress=")
+                || lower_c.starts_with("uncompress=")
+                || lower_c.starts_with("order=")
+            {
+                continue;
+            }
+            let col = extract_ident_token(trimmed);
+            if col.is_empty() {
                 continue;
             }
             defs.push(format!("{} TEXT", col));
