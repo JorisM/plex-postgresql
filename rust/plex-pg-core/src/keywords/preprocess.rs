@@ -1286,10 +1286,15 @@ fn rewrite_single_virtual_table_stmt(stmt: &str) -> Option<String> {
         return None;
     };
 
-    let table_name = stmt[prefix.len()..using_idx].trim();
-    if table_name.is_empty() {
+    let raw_table_name = stmt[prefix.len()..using_idx].trim();
+    if raw_table_name.is_empty() {
         return None;
     }
+    // Strip single-quote / double-quote / backtick wrappers from the table
+    // name. SQLite tolerates `CREATE VIRTUAL TABLE 'locations' USING ...`
+    // but the emitted PG `CREATE TABLE` must have a bare or
+    // double-quoted identifier (sqlparser-rs rejects single-quoted ones).
+    let table_name = strip_outer_quotes(raw_table_name);
 
     let cols_start = using_idx + using_len;
     let cols_end = stmt.rfind(')')?;
@@ -1321,7 +1326,7 @@ fn rewrite_single_virtual_table_stmt(stmt: &str) -> Option<String> {
             {
                 continue;
             }
-            let col = extract_ident_token(trimmed);
+            let col = strip_outer_quotes(&extract_ident_token(trimmed));
             if col.is_empty() {
                 continue;
             }
@@ -1330,7 +1335,7 @@ fn rewrite_single_virtual_table_stmt(stmt: &str) -> Option<String> {
         defs.push("_fts TSVECTOR".to_string());
     } else {
         for c in cols {
-            let col = extract_ident_token(&c);
+            let col = strip_outer_quotes(&extract_ident_token(&c));
             if col.is_empty() {
                 continue;
             }
@@ -2408,6 +2413,22 @@ fn split_csv_top_level(s: &str) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
     out
+}
+
+fn strip_outer_quotes(s: &str) -> String {
+    let t = s.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' && last == b'\'')
+            || (first == b'"' && last == b'"')
+            || (first == b'`' && last == b'`')
+        {
+            return t[1..t.len() - 1].to_string();
+        }
+    }
+    t.to_string()
 }
 
 fn extract_ident_token(raw: &str) -> String {
